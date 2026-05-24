@@ -38,6 +38,7 @@
 
 #include <explore/explore.h>
 
+#include <limits>
 #include <thread>
 
 inline static bool same_point(const geometry_msgs::msg::Point& one,
@@ -57,7 +58,7 @@ Explore::Explore()
   , tf_buffer_(this->get_clock())
   , tf_listener_(tf_buffer_)
   , costmap_client_(*this, &tf_buffer_)
-  , prev_distance_(0)
+  , prev_distance_(std::numeric_limits<double>::infinity())
   , last_markers_count_(0)
 {
   double timeout;
@@ -128,7 +129,7 @@ Explore::Explore()
       return_to_init_ = false;
     }
   }
-
+  
   exploring_timer_ = this->create_wall_timer(
       std::chrono::milliseconds((uint16_t)(1000.0 / planner_frequency_)),
       [this]() { makePlan(); });
@@ -228,17 +229,12 @@ void Explore::visualizeFrontiers(
 
 void Explore::makePlan()
 {
-  if (plan_in_progress_)
-  {
-    return;
-  }
-  // find frontiers
   auto pose = costmap_client_.getRobotPose();
   // get frontiers sorted according to cost
   auto frontiers = search_.searchFrom(pose.position);
   RCLCPP_INFO(logger_, "found %lu frontiers", frontiers.size());
   for (size_t i = 0; i < frontiers.size(); ++i) {
-    // RCLCPP_INFO(logger_, "frontier %zd cost: %f", i, frontiers[i].cost);
+    // RCLCPP_DEBUG(logger_, "frontier %zd cost: %f", i, frontiers[i].cost);
   }
 
   if (frontiers.empty()) {
@@ -270,19 +266,21 @@ void Explore::makePlan()
     return;
   }
   geometry_msgs::msg::Point target_position = frontier->centroid;
-
+  
   // time out if we are not making any progress
   bool same_goal = same_point(prev_goal_, target_position);
+  bool goal_is_active = goal_active_.load(std::memory_order_relaxed);
 
   prev_goal_ = target_position;
-  if (!same_goal || prev_distance_ > frontier->min_distance) {
+  if (!same_goal || !goal_is_active || prev_distance_ > frontier->min_distance) {
     // we have different goal or we made some progress
     last_progress_ = this->now();
     prev_distance_ = frontier->min_distance;
   }
   // black list if we've made no progress for a long time
-  if ((this->now() - last_progress_ >
-      tf2::durationFromSec(progress_timeout_)) && !resuming_) {
+  if (goal_is_active &&
+      (this->now() - last_progress_ > tf2::durationFromSec(progress_timeout_)) &&
+      !resuming_) {
     frontier_blacklist_.push_back(target_position);
     RCLCPP_INFO(logger_, "Adding current goal to black list");
     makePlan();
@@ -295,7 +293,7 @@ void Explore::makePlan()
   }
 
   // we don't need to do anything if we still pursuing the same goal
-  if (same_goal) {
+  if (same_goal && goal_is_active) {
     return;
   }
 
@@ -319,31 +317,31 @@ RCLCPP_INFO(logger_, "Goal orientation: x=%.2f, y=%.2f, z=%.2f, w=%.2f",
             goal.pose.pose.orientation.w);
 RCLCPP_INFO(logger_, "Goal frame_id: %s", goal.pose.header.frame_id.c_str());
 
+  // Stamp this goal with a unique ID so stale result callbacks are discarded
+  uint64_t goal_id =
+      goal_id_counter_.fetch_add(1) + 1;
+  active_goal_id_.store(goal_id);
+  goal_active_.store(true);
+
   auto send_goal_options =
       rclcpp_action::Client<nav2_msgs::action::NavigateToPose>::SendGoalOptions();
-  // send_goal_options.goal_response_callback =
-  // std::bind(&Explore::goal_response_callback, this, _1);
-  // send_goal_options.feedback_callback =
-  //   std::bind(&Explore::feedback_callback, this, _1, _2);
-  send_goal_options.result_callback =
-      [this,
-       target_position](const NavigationGoalHandle::WrappedResult& result) {
-        reachedGoal(result, target_position);
-      };
+
   send_goal_options.goal_response_callback =
       [this](const NavigationGoalHandle::SharedPtr& goal_handle) {
         if (!goal_handle) {
           RCLCPP_ERROR(logger_, "Goal was REJECTED by the action server");
+          goal_active_.store(false);
         } else {
-          RCLCPP_INFO(logger_, "Goal ACCEPTED by the action server, UUID: ...");
+          RCLCPP_DEBUG(logger_, "Goal ACCEPTED by the action server");
         }
       };
-  // send_goal_options.feedback_callback =
-  //     [this](NavigationGoalHandle::SharedPtr,
-  //           const std::shared_ptr<const nav2_msgs::action::NavigateToPose::Feedback> feedback) {
-  //       RCLCPP_INFO(logger_, "Distance remaining: %.2f m", feedback->distance_remaining);
-  //     };
-  plan_in_progress_ = true;
+
+  send_goal_options.result_callback =
+      [this, target_position, goal_id](
+          const NavigationGoalHandle::WrappedResult& result) {
+        reachedGoal(result, target_position, goal_id);
+      };
+
   move_base_client_->async_send_goal(goal, send_goal_options);
 }
 
@@ -391,23 +389,36 @@ bool Explore::goalOnBlacklist(const geometry_msgs::msg::Point& goal)
 }
 
 void Explore::reachedGoal(const NavigationGoalHandle::WrappedResult& result,
-                          const geometry_msgs::msg::Point& frontier_goal)
+                          const geometry_msgs::msg::Point& frontier_goal,
+                          uint64_t goal_id)
 {
-  plan_in_progress_ = false;
+  // discard stale callbacks from previously preempted goals
+  if (goal_id != active_goal_id_.load()) {
+    RCLCPP_INFO(logger_, "Ignoring stale goal result (goal_id mismatch)");
+    return;
+  }
+
+  goal_active_.store(false);
+
   switch (result.code) {
     case rclcpp_action::ResultCode::SUCCEEDED:
-      RCLCPP_INFO(logger_, "Goal was successful");
+      RCLCPP_DEBUG(logger_, "Goal was successful");
+      last_progress_ = this->now();
+      prev_distance_ = std::numeric_limits<double>::infinity();
       break;
-    case rclcpp_action::ResultCode::ABORTED:
-      RCLCPP_INFO(logger_, "Goal was aborted");
-      frontier_blacklist_.push_back(frontier_goal);
-      RCLCPP_INFO(logger_, "Adding current goal to black list");
-      // Print the error code and message from the result
-      RCLCPP_INFO(logger_, "Error code: %d", result.result->error_code);
-      RCLCPP_INFO(logger_, "Error message: %s", result.result->error_msg.c_str());
 
-      // If it was aborted probably because we've found another frontier goal,
-      // so just return and don't make plan again
+    case rclcpp_action::ResultCode::ABORTED:
+      // only blacklist on real Nav2 failures (error_code != 0).
+      // error_code=0 with empty message means the goal was preempted by a new
+      // goal being sent, not a genuine navigation failure.
+      if (result.result && result.result->error_code != 0) {
+        RCLCPP_WARN(logger_, "Goal aborted with error_code=%d (%s) — blacklisting frontier",
+                    result.result->error_code,
+                    result.result->error_msg.c_str());
+        frontier_blacklist_.push_back(frontier_goal);
+      } else {
+        RCLCPP_INFO(logger_, "Goal aborted with error_code=0 — likely a preemption, not blacklisting");
+      }
       return;
     case rclcpp_action::ResultCode::CANCELED:
       RCLCPP_INFO(logger_, "Goal was canceled");
@@ -441,7 +452,8 @@ void Explore::start()
 void Explore::stop(bool finished_exploring)
 {
   RCLCPP_INFO(logger_, "Exploration stopped.");
-
+  goal_active_.store(false);
+  active_goal_id_.store(0);
   // Only publish paused status if manually stopped (not finished exploring)
   if (!finished_exploring) {
     auto status_msg = explore_lite_msgs::msg::ExploreStatus();
