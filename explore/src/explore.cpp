@@ -228,13 +228,17 @@ void Explore::visualizeFrontiers(
 
 void Explore::makePlan()
 {
+  if (plan_in_progress_)
+  {
+    return;
+  }
   // find frontiers
   auto pose = costmap_client_.getRobotPose();
   // get frontiers sorted according to cost
   auto frontiers = search_.searchFrom(pose.position);
-  RCLCPP_DEBUG(logger_, "found %lu frontiers", frontiers.size());
+  RCLCPP_INFO(logger_, "found %lu frontiers", frontiers.size());
   for (size_t i = 0; i < frontiers.size(); ++i) {
-    RCLCPP_DEBUG(logger_, "frontier %zd cost: %f", i, frontiers[i].cost);
+    // RCLCPP_INFO(logger_, "frontier %zd cost: %f", i, frontiers[i].cost);
   }
 
   if (frontiers.empty()) {
@@ -280,7 +284,7 @@ void Explore::makePlan()
   if ((this->now() - last_progress_ >
       tf2::durationFromSec(progress_timeout_)) && !resuming_) {
     frontier_blacklist_.push_back(target_position);
-    RCLCPP_DEBUG(logger_, "Adding current goal to black list");
+    RCLCPP_INFO(logger_, "Adding current goal to black list");
     makePlan();
     return;
   }
@@ -295,7 +299,7 @@ void Explore::makePlan()
     return;
   }
 
-  RCLCPP_DEBUG(logger_, "Sending goal to move base nav2");
+  RCLCPP_INFO(logger_, "Sending goal to move base nav2 ");
 
   // send goal to move_base if we have something new to pursue
   auto goal = nav2_msgs::action::NavigateToPose::Goal();
@@ -303,6 +307,17 @@ void Explore::makePlan()
   goal.pose.pose.orientation.w = 1.;
   goal.pose.header.frame_id = costmap_client_.getGlobalFrameID();
   goal.pose.header.stamp = this->now();
+
+  RCLCPP_INFO(logger_, "Goal position: x=%.2f, y=%.2f, z=%.2f", 
+            goal.pose.pose.position.x, 
+            goal.pose.pose.position.y, 
+            goal.pose.pose.position.z);
+RCLCPP_INFO(logger_, "Goal orientation: x=%.2f, y=%.2f, z=%.2f, w=%.2f",
+            goal.pose.pose.orientation.x,
+            goal.pose.pose.orientation.y,
+            goal.pose.pose.orientation.z,
+            goal.pose.pose.orientation.w);
+RCLCPP_INFO(logger_, "Goal frame_id: %s", goal.pose.header.frame_id.c_str());
 
   auto send_goal_options =
       rclcpp_action::Client<nav2_msgs::action::NavigateToPose>::SendGoalOptions();
@@ -315,6 +330,20 @@ void Explore::makePlan()
        target_position](const NavigationGoalHandle::WrappedResult& result) {
         reachedGoal(result, target_position);
       };
+  send_goal_options.goal_response_callback =
+      [this](const NavigationGoalHandle::SharedPtr& goal_handle) {
+        if (!goal_handle) {
+          RCLCPP_ERROR(logger_, "Goal was REJECTED by the action server");
+        } else {
+          RCLCPP_INFO(logger_, "Goal ACCEPTED by the action server, UUID: ...");
+        }
+      };
+  // send_goal_options.feedback_callback =
+  //     [this](NavigationGoalHandle::SharedPtr,
+  //           const std::shared_ptr<const nav2_msgs::action::NavigateToPose::Feedback> feedback) {
+  //       RCLCPP_INFO(logger_, "Distance remaining: %.2f m", feedback->distance_remaining);
+  //     };
+  plan_in_progress_ = true;
   move_base_client_->async_send_goal(goal, send_goal_options);
 }
 
@@ -364,19 +393,24 @@ bool Explore::goalOnBlacklist(const geometry_msgs::msg::Point& goal)
 void Explore::reachedGoal(const NavigationGoalHandle::WrappedResult& result,
                           const geometry_msgs::msg::Point& frontier_goal)
 {
+  plan_in_progress_ = false;
   switch (result.code) {
     case rclcpp_action::ResultCode::SUCCEEDED:
-      RCLCPP_DEBUG(logger_, "Goal was successful");
+      RCLCPP_INFO(logger_, "Goal was successful");
       break;
     case rclcpp_action::ResultCode::ABORTED:
-      RCLCPP_DEBUG(logger_, "Goal was aborted");
+      RCLCPP_INFO(logger_, "Goal was aborted");
       frontier_blacklist_.push_back(frontier_goal);
-      RCLCPP_DEBUG(logger_, "Adding current goal to black list");
+      RCLCPP_INFO(logger_, "Adding current goal to black list");
+      // Print the error code and message from the result
+      RCLCPP_INFO(logger_, "Error code: %d", result.result->error_code);
+      RCLCPP_INFO(logger_, "Error message: %s", result.result->error_msg.c_str());
+
       // If it was aborted probably because we've found another frontier goal,
       // so just return and don't make plan again
       return;
     case rclcpp_action::ResultCode::CANCELED:
-      RCLCPP_DEBUG(logger_, "Goal was canceled");
+      RCLCPP_INFO(logger_, "Goal was canceled");
       // If goal canceled might be because exploration stopped from topic. Don't make new plan.
       return;
     default:
