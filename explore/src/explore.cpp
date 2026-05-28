@@ -388,6 +388,7 @@ void Explore::reachedGoal(const NavigationGoalHandle::WrappedResult& result,
       prev_distance_ = 0;
       break;
     case rclcpp_action::ResultCode::ABORTED:
+#ifdef NAV2_RESULT_HAS_ERROR_CODE
       if (result.result && result.result->error_code != 0) {
         RCLCPP_DEBUG(logger_, "Goal aborted with error_code=%d (%s) — blacklisting frontier",
                      result.result->error_code,
@@ -396,6 +397,11 @@ void Explore::reachedGoal(const NavigationGoalHandle::WrappedResult& result,
       } else {
         RCLCPP_DEBUG(logger_, "Goal aborted with error_code=0 — likely a preemption, not blacklisting");
       }
+#else
+      // Humble: no error_code field, blacklist unconditionally on abort
+      RCLCPP_DEBUG(logger_, "Goal aborted — blacklisting frontier");
+      frontier_blacklist_.push_back(frontier_goal);
+#endif
       // If it was aborted probably because we've found another frontier goal,
       // so just return and don't make plan again
       return;

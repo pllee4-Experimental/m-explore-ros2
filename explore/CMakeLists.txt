@@ -45,6 +45,10 @@ find_package(visualization_msgs REQUIRED)
 find_package(nav2_costmap_2d REQUIRED)
 find_package(explore_lite_msgs REQUIRED)
 
+if(nav2_msgs_VERSION VERSION_GREATER_EQUAL "1.3.0")
+  target_compile_definitions(explore PRIVATE NAV2_RESULT_HAS_ERROR_CODE)
+endif()
+
 set(DEPENDENCIES
   rclcpp
   std_msgs

@@ -1,6 +1,6 @@
 name: ROS2 build/tests
 on:
-  pull_request:
+  push:
 jobs:
   build_and_tests:
     runs-on: ubuntu-24.04
